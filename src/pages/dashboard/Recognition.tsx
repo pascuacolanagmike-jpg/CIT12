@@ -4,7 +4,6 @@ import { loadFaceModels, extractFaceData, findBestMatch, type FaceData } from '@
 import type { Student, RecognitionLog } from '@/lib/types';
 import {
   Camera,
-  ScanFace,
   CheckCircle,
   XCircle,
   Loader2,
@@ -12,113 +11,244 @@ import {
   RefreshCw,
   Activity,
   Clock,
-  User as UserIcon,
   Image as ImageIcon,
 } from 'lucide-react';
+
+/** Convert whatever Supabase gives us (jsonb string, number[], Float32Array) into a Float32Array */
+function toFloat32(descriptor: unknown): Float32Array | null {
+  if (!descriptor) return null;
+  try {
+    if (descriptor instanceof Float32Array) return descriptor;
+    if (Array.isArray(descriptor)) return new Float32Array(descriptor);
+    if (typeof descriptor === 'string') {
+      const parsed = JSON.parse(descriptor);
+      if (Array.isArray(parsed)) return new Float32Array(parsed);
+    }
+    if (typeof descriptor === 'object') {
+      // some drivers wrap it in {0: .., 1: ..}
+      const arr = Object.values(descriptor as Record<string, number>);
+      if (arr.length && typeof arr[0] === 'number') return new Float32Array(arr);
+    }
+  } catch (err) {
+    console.warn('Could not normalize descriptor', err);
+  }
+  return null;
+}
+
+interface TestResult {
+  matched: boolean;
+  student?: Student;
+  confidence?: number;
+  faceData?: FaceData;
+  reason?: 'no-face' | 'no-students' | 'below-threshold' | 'error';
+  errorMessage?: string;
+}
 
 export default function Recognition() {
   const [logs, setLogs] = useState<RecognitionLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
   const [students, setStudents] = useState<Student[]>([]);
+  const [modelsReady, setModelsReady] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
   const [testImage, setTestImage] = useState<string | null>(null);
-  const [testResult, setTestResult] = useState<{
-    matched: boolean;
-    student?: Student;
-    confidence?: number;
-    faceData?: FaceData;
-  } | null>(null);
+  const [testResult, setTestResult] = useState<TestResult | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const testImageRef = useRef<HTMLImageElement | null>(null);
 
+  /* ---------------- data fetching ---------------- */
+
   const fetchLogs = useCallback(async () => {
     setLoading(true);
-    const { data, error } = await supabase
+    // Try the joined query first; if the FK isn't set up, fall back to plain logs.
+    const joined = await supabase
       .from('recognition_logs')
       .select('*, student:students(*)')
       .order('created_at', { ascending: false })
       .limit(50);
 
-    if (error) {
-      console.error('Error fetching logs:', error);
+    if (joined.error) {
+      console.warn('Joined log query failed, falling back:', joined.error.message);
+      const plain = await supabase
+        .from('recognition_logs')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(50);
+
+      if (plain.error) {
+        console.error('Error fetching logs:', plain.error);
+        setLogs([]);
+      } else {
+        setLogs((plain.data ?? []) as RecognitionLog[]);
+      }
     } else {
-      setLogs(data as RecognitionLog[]);
+      setLogs((joined.data ?? []) as RecognitionLog[]);
     }
     setLoading(false);
   }, []);
 
   const fetchStudents = useCallback(async () => {
+    // ✅ FIX 1: proper "IS NOT NULL" filter (not .eq)
     const { data, error } = await supabase
       .from('students')
       .select('*')
-      .eq('descriptor', 'not.null');
+      .not('descriptor', 'is', null);
 
-    if (!error && data) {
-      setStudents(data as Student[]);
+    if (error) {
+      console.error('Error fetching students:', error);
+      return;
     }
+    setStudents((data ?? []) as Student[]);
   }, []);
+
+  /* ---------------- init ---------------- */
 
   useEffect(() => {
     fetchLogs();
     fetchStudents();
-    loadFaceModels();
+
+    let cancelled = false;
+    (async () => {
+      try {
+        await loadFaceModels();
+        if (!cancelled) setModelsReady(true);
+      } catch (err) {
+        console.error('Failed to load face models:', err);
+        if (!cancelled) setModelsError('Could not load face recognition models.');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [fetchLogs, fetchStudents]);
 
-  const handleTestImage = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  // Clean up object URLs when the component unmounts
+  useEffect(() => {
+    return () => {
+      if (testImage?.startsWith('blob:')) URL.revokeObjectURL(testImage);
+    };
+  }, [testImage]);
+
+  /* ---------------- recognition ---------------- */
+
+  const runRecognition = useCallback(async () => {
+    const img = testImageRef.current;
+    if (!img) return;
+
+    // ✅ FIX 2: don't run until the image is actually decoded
+    if (!img.complete || img.naturalWidth === 0) return;
 
     setProcessing(true);
     setTestResult(null);
-    const url = URL.createObjectURL(file);
-    setTestImage(url);
 
-    // Wait for image to load, then process
-    setTimeout(async () => {
-      if (!testImageRef.current) {
-        setProcessing(false);
+    try {
+      if (!modelsReady) {
+        setTestResult({
+          matched: false,
+          reason: 'error',
+          errorMessage: 'Face models are still loading. Please wait a moment and try again.',
+        });
         return;
       }
 
-      try {
-        const faceData = await extractFaceData(testImageRef.current, true);
-        if (!faceData) {
-          setTestResult({ matched: false, faceData: undefined });
-          setProcessing(false);
-          return;
-        }
-
-        // Find best match among enrolled students
-        const knownDescriptors = students
-          .filter((s) => s.descriptor)
-          .map((s) => ({
-            id: s.id,
-            name: s.full_name,
-            descriptor: s.descriptor!,
-          }));
-
-        const match = findBestMatch(faceData.descriptor, knownDescriptors);
-
-        if (match && match.confidence > 0.5) {
-          const matchedStudent = students.find((s) => s.id === match.id);
-          setTestResult({
-            matched: true,
-            student: matchedStudent,
-            confidence: match.confidence,
-            faceData,
-          });
-        } else {
-          setTestResult({
-            matched: false,
-            faceData,
-          });
-        }
-      } catch (err) {
-        console.error('Recognition error:', err);
+      if (students.length === 0) {
+        setTestResult({
+          matched: false,
+          reason: 'no-students',
+          errorMessage: 'No enrolled students with a face descriptor were found.',
+        });
+        return;
       }
+
+      const faceData = await extractFaceData(img, true);
+
+      if (!faceData) {
+        setTestResult({ matched: false, reason: 'no-face' });
+        return;
+      }
+
+      // ✅ FIX 3: normalize descriptors to Float32Array before matching
+      const probeDescriptor = toFloat32(faceData.descriptor);
+      if (!probeDescriptor) {
+        setTestResult({
+          matched: false,
+          faceData,
+          reason: 'error',
+          errorMessage: 'Extracted face descriptor was invalid.',
+        });
+        return;
+      }
+
+      const knownDescriptors = students
+        .map((s) => {
+          const d = toFloat32(s.descriptor);
+          if (!d) return null;
+          return { id: s.id, name: s.full_name, descriptor: d };
+        })
+        .filter((x): x is { id: string; name: string; descriptor: Float32Array } => x !== null);
+
+      if (knownDescriptors.length === 0) {
+        setTestResult({
+          matched: false,
+          faceData,
+          reason: 'no-students',
+          errorMessage: 'No enrolled students had a valid face descriptor.',
+        });
+        return;
+      }
+
+      const match = findBestMatch(probeDescriptor, knownDescriptors as any);
+
+      if (match && match.confidence > 0.5) {
+        const matchedStudent = students.find((s) => s.id === match.id);
+        setTestResult({
+          matched: true,
+          student: matchedStudent,
+          confidence: match.confidence,
+          faceData,
+        });
+      } else {
+        setTestResult({
+          matched: false,
+          faceData,
+          reason: 'below-threshold',
+          confidence: match?.confidence,
+        });
+      }
+    } catch (err) {
+      console.error('Recognition error:', err);
+      setTestResult({
+        matched: false,
+        reason: 'error',
+        errorMessage: err instanceof Error ? err.message : 'Unknown error during recognition.',
+      });
+    } finally {
       setProcessing(false);
-    }, 500);
+    }
+  }, [students, modelsReady]);
+
+  const handleTestImage = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // revoke the previous preview
+    if (testImage?.startsWith('blob:')) URL.revokeObjectURL(testImage);
+
+    setTestResult(null);
+    setTestImage(URL.createObjectURL(file));
+    // The actual recognition is triggered by <img onLoad={runRecognition} />
   };
+
+  const resetTest = () => {
+    if (testImage?.startsWith('blob:')) URL.revokeObjectURL(testImage);
+    setTestImage(null);
+    setTestResult(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  /* ---------------- helpers ---------------- */
 
   const formatTime = (iso: string) => {
     const d = new Date(iso);
@@ -131,6 +261,8 @@ export default function Recognition() {
     if (hrs < 24) return `${hrs}h ago`;
     return d.toLocaleDateString();
   };
+
+  /* ---------------- render ---------------- */
 
   return (
     <div className="p-6 lg:p-8">
@@ -148,6 +280,12 @@ export default function Recognition() {
         </div>
       </div>
 
+      {modelsError && (
+        <div className="mb-6 p-4 rounded-lg bg-red-500/10 border border-red-500/20 text-red-300 text-sm">
+          {modelsError}
+        </div>
+      )}
+
       <div className="grid lg:grid-cols-2 gap-8">
         {/* Left: Test recognition */}
         <div className="space-y-4">
@@ -161,12 +299,20 @@ export default function Recognition() {
             className="relative aspect-video rounded-2xl border-2 border-dashed border-slate-700 hover:border-emerald-500/50 bg-slate-900 flex items-center justify-center cursor-pointer transition overflow-hidden group"
           >
             {testImage ? (
+              // ✅ FIX 2 (cont.): trigger recognition on load, not on a timer
               <img
                 ref={testImageRef}
                 src={testImage}
                 alt="Test capture"
                 className="w-full h-full object-cover"
-                crossOrigin="anonymous"
+                onLoad={runRecognition}
+                onError={() =>
+                  setTestResult({
+                    matched: false,
+                    reason: 'error',
+                    errorMessage: 'Could not load the selected image.',
+                  })
+                }
               />
             ) : (
               <div className="text-center p-8">
@@ -186,6 +332,15 @@ export default function Recognition() {
             onChange={handleTestImage}
             className="hidden"
           />
+
+          {testImage && !processing && (
+            <button
+              onClick={resetTest}
+              className="text-xs text-slate-400 hover:text-slate-200 transition"
+            >
+              Clear image
+            </button>
+          )}
 
           {processing && (
             <div className="flex items-center gap-3 p-4 rounded-lg bg-blue-500/10 border border-blue-500/20">
@@ -230,9 +385,21 @@ export default function Recognition() {
                     <>
                       <p className="text-amber-400 font-semibold text-lg">No Match Found</p>
                       <p className="text-sm text-slate-300 mt-1">
-                        {testResult.faceData
-                          ? 'Face detected but no enrolled student matched.'
-                          : 'No face detected in the image.'}
+                        {testResult.reason === 'no-face' &&
+                          'No face detected in the image.'}
+                        {testResult.reason === 'no-students' &&
+                          (testResult.errorMessage ??
+                            'No enrolled students with a valid face descriptor.')}
+                        {testResult.reason === 'below-threshold' &&
+                          `Face detected but the best match was below the confidence threshold${
+                            testResult.confidence != null
+                              ? ` (best: ${(testResult.confidence * 100).toFixed(1)}%)`
+                              : ''
+                          }.`}
+                        {testResult.reason === 'error' &&
+                          (testResult.errorMessage ?? 'An error occurred during recognition.')}
+                        {!testResult.reason &&
+                          'Face detected but no enrolled student matched.'}
                       </p>
                     </>
                   )}
@@ -276,7 +443,11 @@ export default function Recognition() {
                 >
                   <div className="w-14 h-14 rounded-lg overflow-hidden bg-slate-800 flex-shrink-0 ring-1 ring-slate-700">
                     {log.image_url ? (
-                      <img src={log.image_url} alt="Capture" className="w-full h-full object-cover" />
+                      <img
+                        src={log.image_url}
+                        alt="Capture"
+                        className="w-full h-full object-cover"
+                      />
                     ) : (
                       <div className="w-full h-full flex items-center justify-center">
                         <ImageIcon className="w-5 h-5 text-slate-600" />
@@ -287,13 +458,15 @@ export default function Recognition() {
                   <div className="flex-1 min-w-0">
                     {log.matched && log.student ? (
                       <>
-                        <p className="text-white font-medium truncate">{log.student.full_name}</p>
+                        <p className="text-white font-medium truncate">
+                          {log.student.full_name}
+                        </p>
                         <div className="flex items-center gap-3 mt-0.5">
                           <span className="flex items-center gap-1 text-xs text-emerald-400">
                             <CheckCircle className="w-3 h-3" />
                             Matched
                           </span>
-                          {log.confidence !== null && (
+                          {log.confidence !== null && log.confidence !== undefined && (
                             <span className="text-xs text-slate-500">
                               {(log.confidence * 100).toFixed(1)}% confidence
                             </span>
