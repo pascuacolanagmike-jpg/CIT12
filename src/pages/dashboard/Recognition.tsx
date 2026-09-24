@@ -16,6 +16,7 @@ import {
   FlaskConical,
   ChevronDown,
   ChevronUp,
+  Trash2,
 } from 'lucide-react';
 
 /** Normalize whatever Supabase returns into a Float32Array */
@@ -36,6 +37,15 @@ function toFloat32(descriptor: unknown): Float32Array | null {
     console.warn('Could not normalize descriptor', err);
   }
   return null;
+}
+
+/** Extract the storage object path from a public URL. */
+function getStoragePath(imageUrl: string | null | undefined): string | null {
+  if (!imageUrl) return null;
+  const marker = '/storage/v1/object/public/captures/';
+  const idx = imageUrl.indexOf(marker);
+  if (idx === -1) return null;
+  return imageUrl.slice(idx + marker.length);
 }
 
 interface TestResult {
@@ -59,7 +69,11 @@ export default function Recognition() {
   // Realtime
   const [liveConnected, setLiveConnected] = useState(false);
 
-  // Manual test (kept as a debugging tool)
+  // Delete actions
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [clearingAll, setClearingAll] = useState(false);
+
+  // Manual test
   const [showManualTest, setShowManualTest] = useState(false);
   const [testImage, setTestImage] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<TestResult | null>(null);
@@ -136,16 +150,12 @@ export default function Recognition() {
     async (log: RecognitionLog) => {
       if (!log.image_url) return;
       if (processedIdsRef.current.has(log.id)) return;
-      if (!modelsReady) {
-        console.warn('Models not ready yet — skipping log', log.id);
-        return;
-      }
-      if (log.matched) return; // already resolved
+      if (!modelsReady) return;
+      if (log.matched) return;
 
       processedIdsRef.current.add(log.id);
 
       try {
-        // Download the captured image from Supabase Storage
         const img = new Image();
         img.crossOrigin = 'anonymous';
         img.src = log.image_url;
@@ -156,10 +166,7 @@ export default function Recognition() {
         });
 
         const faceData = await extractFaceData(img, true);
-        if (!faceData) {
-          console.log(`[${log.id}] No face detected in ESP32 capture`);
-          return;
-        }
+        if (!faceData) return;
 
         const probe = toFloat32(faceData.descriptor);
         if (!probe) return;
@@ -185,7 +192,6 @@ export default function Recognition() {
               confidence: match.confidence,
             })
             .eq('id', log.id);
-          // The UPDATE subscription will refresh the list automatically
         }
       } catch (err) {
         console.error(`Failed to process log ${log.id}:`, err);
@@ -194,7 +200,7 @@ export default function Recognition() {
     [modelsReady, students]
   );
 
-  /* -------------------- realtime subscription -------------------- */
+  /* -------------------- realtime -------------------- */
 
   useEffect(() => {
     const channel = supabase
@@ -211,18 +217,107 @@ export default function Recognition() {
       .on(
         'postgres_changes',
         { event: 'UPDATE', schema: 'public', table: 'recognition_logs' },
-        () => {
-          fetchLogs();
-        }
+        () => fetchLogs()
       )
-      .subscribe((status) => {
-        setLiveConnected(status === 'SUBSCRIBED');
-      });
+      .on(
+        'postgres_changes',
+        { event: 'DELETE', schema: 'public', table: 'recognition_logs' },
+        () => fetchLogs()
+      )
+      .subscribe((status) => setLiveConnected(status === 'SUBSCRIBED'));
 
     return () => {
       supabase.removeChannel(channel);
     };
   }, [fetchLogs, processLog]);
+
+  /* -------------------- delete: single -------------------- */
+
+  const deleteLog = useCallback(
+    async (log: RecognitionLog) => {
+      setDeletingId(log.id);
+
+      // Optimistic: remove from UI right away
+      setLogs((prev) => prev.filter((l) => l.id !== log.id));
+
+      try {
+        // Remove the storage object first (best-effort)
+        const path = getStoragePath(log.image_url);
+        if (path) {
+          const { error: storageError } = await supabase.storage
+            .from('captures')
+            .remove([path]);
+          if (storageError) {
+            console.warn('Could not delete storage object:', storageError.message);
+          }
+        }
+
+        // Then remove the DB row
+        const { error } = await supabase
+          .from('recognition_logs')
+          .delete()
+          .eq('id', log.id);
+
+        if (error) {
+          console.error('Delete failed:', error);
+          // Revert by re-fetching
+          fetchLogs();
+        }
+      } catch (err) {
+        console.error('Delete error:', err);
+        fetchLogs();
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [fetchLogs]
+  );
+
+  /* -------------------- delete: clear all -------------------- */
+
+  const clearAllLogs = useCallback(async () => {
+    if (logs.length === 0) return;
+    const ok = window.confirm(
+      `Delete all ${logs.length} recognition log${logs.length !== 1 ? 's' : ''}?\n\nThis also removes the images from storage. Cannot be undone.`
+    );
+    if (!ok) return;
+
+    setClearingAll(true);
+    const previous = logs;
+    setLogs([]); // optimistic clear
+
+    try {
+      // Batch delete storage objects
+      const paths = previous
+        .map((l) => getStoragePath(l.image_url))
+        .filter((p): p is string => p !== null);
+
+      if (paths.length > 0) {
+        const { error: storageError } = await supabase.storage
+          .from('captures')
+          .remove(paths);
+        if (storageError) {
+          console.warn('Some storage objects could not be deleted:', storageError.message);
+        }
+      }
+
+      // Delete all DB rows
+      const { error } = await supabase
+        .from('recognition_logs')
+        .delete()
+        .gte('created_at', '1970-01-01'); // matches everything
+
+      if (error) {
+        console.error('Clear all failed:', error);
+        setLogs(previous); // revert
+      }
+    } catch (err) {
+      console.error('Clear all error:', err);
+      setLogs(previous);
+    } finally {
+      setClearingAll(false);
+    }
+  }, [logs]);
 
   /* -------------------- manual test -------------------- */
 
@@ -520,7 +615,31 @@ export default function Recognition() {
 
         {/* ---------------- Right: Recognition logs ---------------- */}
         <div className="space-y-4">
-          <h2 className="text-lg font-semibold text-white">Recognition History</h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold text-white">
+              Recognition History
+              {logs.length > 0 && (
+                <span className="ml-2 text-xs font-normal text-slate-500">
+                  ({logs.length})
+                </span>
+              )}
+            </h2>
+
+            {logs.length > 0 && (
+              <button
+                onClick={clearAllLogs}
+                disabled={clearingAll}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10 border border-red-500/20 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {clearingAll ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3 h-3" />
+                )}
+                {clearingAll ? 'Clearing...' : 'Clear all'}
+              </button>
+            )}
+          </div>
 
           {loading ? (
             <div className="flex items-center justify-center py-12">
@@ -539,7 +658,9 @@ export default function Recognition() {
               {logs.map((log) => (
                 <div
                   key={log.id}
-                  className="flex items-center gap-4 p-4 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 transition"
+                  className={`group flex items-center gap-4 p-4 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 transition ${
+                    deletingId === log.id ? 'opacity-50' : ''
+                  }`}
                 >
                   <div className="w-14 h-14 rounded-lg overflow-hidden bg-slate-800 flex-shrink-0 ring-1 ring-slate-700">
                     {log.image_url ? (
@@ -594,6 +715,20 @@ export default function Recognition() {
                       </span>
                     </div>
                   </div>
+
+                  {/* Delete button — always visible, brightens on hover */}
+                  <button
+                    onClick={() => deleteLog(log)}
+                    disabled={deletingId === log.id}
+                    title="Delete this scan"
+                    className="p-2 rounded-lg text-slate-600 group-hover:text-red-400 hover:bg-red-500/10 hover:text-red-400 transition flex-shrink-0 disabled:opacity-50"
+                  >
+                    {deletingId === log.id ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Trash2 className="w-4 h-4" />
+                    )}
+                  </button>
                 </div>
               ))}
             </div>
