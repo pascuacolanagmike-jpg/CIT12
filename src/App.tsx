@@ -8,7 +8,6 @@ import StudentList from '@/pages/dashboard/StudentList';
 import RegisterStudent from '@/pages/dashboard/RegisterStudent';
 import Recognition from '@/pages/dashboard/Recognition';
 import ExportData from '@/pages/dashboard/ExportData';
-import ApiDocs from '@/pages/dashboard/ApiDocs';
 import type { JSX } from 'react';
 
 function ProtectedRoute({ children }: { children: JSX.Element }) {
@@ -82,7 +81,6 @@ function AppRoutes() {
         <Route path="register-student" element={<RegisterStudent />} />
         <Route path="recognition" element={<Recognition />} />
         <Route path="export" element={<ExportData />} />
-        <Route path="api-docs" element={<ApiDocs />} />
       </Route>
     </Routes>
   );
