@@ -20,7 +20,7 @@ const navItems = [
   { to: '/dashboard/register-student', label: 'Register Student', icon: UserPlus },
   { to: '/dashboard/recognition', label: 'Recognition Monitor', icon: Camera },
   { to: '/dashboard/export', label: 'Export Data', icon: FileSpreadsheet },
-  { to: '/dashboard/api-docs', label: 'API Documentation', icon: Code2 },
+  
 ];
 
 export default function DashboardLayout() {
